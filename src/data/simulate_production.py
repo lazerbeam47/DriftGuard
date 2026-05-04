@@ -22,7 +22,7 @@ def simulate_day(reference_df, reference_y, day):
 
 
 def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True) 
 
     # IMPORTANT: preserve index
     reference = pd.read_csv("data/reference.csv", index_col=0)
