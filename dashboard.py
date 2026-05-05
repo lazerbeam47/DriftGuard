@@ -9,6 +9,7 @@ import glob
 import importlib.util
 import sys
 import pickle
+import joblib
 
 import numpy as np
 import pandas as pd
@@ -119,8 +120,7 @@ def load_production_files():
 def load_model():
     if os.path.exists("model.pkl"):
         try:
-            with open("model.pkl", "rb") as f:
-                return pickle.load(f)
+            return joblib.load("model.pkl")
         except Exception:
             return None
     return None
@@ -213,8 +213,98 @@ all_days_df = compute_all_days(tuple(prod_files), psi_thresh, ks_thresh)
 # ─────────────────────────────────────────────
 # TAB LAYOUT
 # ─────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs([
-    "📊 Overview", "🔍 Feature Drift", "🎯 Prediction Drift", "📉 Performance"
+# ─────────────────────────────────────────────
+# SMART ALERTING LOGIC
+# This is the core anti-alert-fatigue system.
+# Instead of screaming about every feature that moves,
+# we only care about features the model actually relies on.
+# ─────────────────────────────────────────────
+
+def compute_risk_scores(model, feature_names, all_days_df, psi_thresh, consecutive_days=3):
+    """
+    Computes a Risk Score per feature = PSI × Feature Importance.
+    Then checks if that risk score has been high for N consecutive days.
+    Only features that are BOTH important AND consistently drifting get flagged.
+
+    Returns a dataframe with one row per feature, sorted by risk score.
+    """
+
+    # --- Step 1: Get feature importance from the model ---
+    # model.coef_ gives us the weights the logistic regression learned.
+    # A higher weight (positive or negative) means the model leans on that feature more.
+    # We take abs() because direction doesn't matter — we care about magnitude.
+    # Result: a numpy array like [0.3, 0.8, 0.05, ...] — one number per feature
+    raw_importance = np.abs(model.coef_[0])
+
+    # Normalize so importances add up to 1 (makes them easier to compare)
+    # e.g. [0.3, 0.8, 0.05] → [0.25, 0.67, 0.04]
+    total = raw_importance.sum()
+    normalized_importance = raw_importance / total if total > 0 else raw_importance
+
+    # Build a dictionary: {"LIMIT_BAL": 0.25, "PAY_0": 0.67, ...}
+    importance_map = dict(zip(feature_names, normalized_importance))
+
+    # --- Step 2: Get the PSI for each feature on the MOST RECENT day ---
+    # all_days_df has one row per production day, one column per feature's PSI
+    # e.g. columns: ["day", "LIMIT_BAL_psi", "PAY_0_psi", ...]
+    # .iloc[-1] grabs the last row = most recent day
+    latest_day = all_days_df.iloc[-1]
+
+    # --- Step 3: For each feature, compute Risk Score = PSI × Importance ---
+    results = []
+    for feature in feature_names:
+
+        psi_col = f"{feature}_psi"   # column name in all_days_df for this feature's PSI
+
+        # Skip if we don't have PSI data for this feature
+        if psi_col not in all_days_df.columns:
+            continue
+
+        # Get this feature's PSI on the latest day
+        latest_psi = latest_day[psi_col]
+
+        # Get this feature's importance (how much the model relies on it)
+        importance = importance_map.get(feature, 0)
+
+        # Risk Score: high PSI + high importance = danger
+        # e.g. PSI=0.8, importance=0.67 → risk=0.536 (very dangerous)
+        # e.g. PSI=0.8, importance=0.04 → risk=0.032 (not worth alerting)
+        risk_score = latest_psi * importance
+
+        # --- Step 4: Check if drift has been sustained for N consecutive days ---
+        # We don't want to alert on one-off spikes.
+        # Only alert if the feature has been above threshold for 3+ days in a row.
+
+        # Get the PSI values for this feature across ALL days as a list
+        # e.g. [0.05, 0.12, 0.25, 0.31, 0.28] — one per day
+        psi_history = all_days_df[psi_col].tolist()
+
+        # Look at only the last N days
+        # e.g. if consecutive_days=3, look at last 3 values
+        recent_psi = psi_history[-consecutive_days:]
+
+        # Check if ALL of those recent values are above the critical threshold
+        # all([True, True, True]) → True (sustained drift → alert)
+        # all([True, False, True]) → False (not sustained → no alert)
+        sustained = len(recent_psi) >= consecutive_days and all(p >= psi_thresh for p in recent_psi)
+
+        results.append({
+            "Feature":    feature,
+            "Importance": round(importance, 4),   # how much the model uses this feature
+            "Latest PSI": round(latest_psi, 4),   # how much this feature has drifted today
+            "Risk Score": round(risk_score, 4),   # combined danger signal
+            "Sustained":  sustained,               # has it been drifting for 3+ days?
+            "Should Alert": sustained and risk_score > 0.05,  # final yes/no alert decision
+        })
+
+    # Sort by Risk Score descending — most dangerous features first
+    results_df = pd.DataFrame(results).sort_values("Risk Score", ascending=False)
+
+    return results_df
+
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📊 Overview", "🔍 Feature Drift", "🎯 Prediction Drift", "📉 Performance", "🚨 Smart Alerts"
 ])
 
 # ══════════════════════════════════════════════
@@ -469,10 +559,21 @@ with tab4:
             from sklearn.metrics import roc_auc_score, classification_report
 
             common_cols_perf = [c for c in numeric_cols if c in prod_df.columns]
-            y_true  = labels_df.iloc[:, 0].values
+
+            # The labels file has multiple columns — grab "target" specifically
+            y_true = labels_df["target"].values.astype(int)
+
+            # Labels file might be larger than production file (e.g. full dataset vs one day)
+            # Trim labels to match the number of rows in production data
+            n = len(prod_df)
+            y_true = y_true[:n]
+
+            # Get predicted probabilities for class 1 (default = yes)
             y_score = model.predict_proba(prod_df[common_cols_perf])[:, 1]
+
             y_pred  = (y_score >= 0.5).astype(int)
 
+            # Binary classification — 0 vs 1
             overall_auc = roc_auc_score(y_true, y_score)
 
             c1, c2, c3 = st.columns(3)
@@ -534,6 +635,229 @@ with tab4:
 
         except Exception as e:
             st.error(f"Error computing performance metrics: {e}")
+
+# ══════════════════════════════════════════════
+# TAB 5 — SMART ALERTS
+# ══════════════════════════════════════════════
+with tab5:
+    st.subheader("🚨 Smart Alert Center")
+    st.caption("Only alerts that actually matter — filtered by feature importance and sustained drift.")
+
+    # We need the model to get feature importances.
+    # If model isn't loaded, we can't do smart alerting.
+    if model is None:
+        st.warning("⚠️ Model not loaded. Smart alerts require `model.pkl`. Re-run `main.ipynb` to generate it.")
+    elif len(all_days_df) < 1:
+        st.info("Need at least 1 day of production data to compute alerts.")
+    else:
+        # Get the features that exist in both reference data and all_days_df
+        # These are the features we can actually compute PSI for
+        common_alert_cols = [
+            c for c in numeric_cols          # all numeric columns in reference data
+            if f"{c}_psi" in all_days_df.columns  # that also have PSI computed
+        ]
+
+        # How many consecutive days of drift before we alert?
+        # Putting this in the sidebar so the user can tune it
+        consecutive_days = st.sidebar.slider(
+            "Consecutive days before alert", 1, 7,
+            value=min(3, len(all_days_df)),   # default 3, but cap at available days
+            step=1
+        )
+
+        # --- Run the smart alerting logic ---
+        # This calls the function we defined above
+        # Returns a dataframe: one row per feature, sorted by Risk Score
+        risk_df = compute_risk_scores(
+            model=model,
+            feature_names=common_alert_cols,
+            all_days_df=all_days_df,
+            psi_thresh=psi_thresh,
+            consecutive_days=consecutive_days
+        )
+
+        # --- Split features into three groups ---
+
+        # Features that SHOULD be alerted on right now
+        # Should Alert = True means: high risk score AND sustained drift
+        alert_features = risk_df[risk_df["Should Alert"] == True]
+
+        # Features that are drifting but either not important enough
+        # or not sustained long enough to alert on
+        watch_features = risk_df[
+            (risk_df["Should Alert"] == False) &   # not alerting yet
+            (risk_df["Latest PSI"] >= PSI_WARN)    # but PSI is elevated (above warning level)
+        ]
+
+        # Everything else — features that are healthy, ignore them
+        healthy_features = risk_df[
+            (risk_df["Should Alert"] == False) &
+            (risk_df["Latest PSI"] < PSI_WARN)
+        ]
+
+        # ── Daily Summary Banner ──
+        # This is what you'd put in a Slack message — one clean summary
+        st.markdown("### 📋 Daily Summary")
+
+        # Show one banner based on overall situation
+        if len(alert_features) > 0:
+            # Build a comma-separated list of features that need action
+            # e.g. "PAY_0, LIMIT_BAL"
+            alert_names = ", ".join(alert_features["Feature"].tolist())
+            st.error(
+                f"🚨 **{len(alert_features)} feature(s) require immediate attention:** {alert_names}\n\n"
+                f"These features are both high-importance AND have been drifting for "
+                f"{consecutive_days}+ consecutive days."
+            )
+        elif len(watch_features) > 0:
+            watch_names = ", ".join(watch_features["Feature"].tolist())
+            st.warning(
+                f"⚠️ **{len(watch_features)} feature(s) to watch:** {watch_names}\n\n"
+                f"Drift detected but not yet sustained or not high enough risk to alert."
+            )
+        else:
+            st.success(
+                f"✅ **All clear.** {len(healthy_features)} features monitored. No action needed."
+            )
+
+        st.divider()
+
+        # ── KPI cards ──
+        c1, c2, c3 = st.columns(3)
+        c1.metric("🚨 Alert Now",   len(alert_features))
+        c2.metric("⚠️ Watch",       len(watch_features))
+        c3.metric("✅ Healthy",     len(healthy_features))
+
+        st.divider()
+
+        # ── Risk Score Bar Chart ──
+        # Shows all features ranked by risk score
+        # Color: red = alerting, yellow = watching, green = healthy
+        st.markdown("### 📊 Feature Risk Score Ranking")
+        st.caption("Risk Score = PSI × Feature Importance. Higher = more dangerous.")
+
+        # Build a color list: one color per feature row
+        colors = []
+        for _, row in risk_df.iterrows():
+            if row["Should Alert"]:
+                colors.append("#ef4444")   # red — alert
+            elif row["Latest PSI"] >= PSI_WARN:
+                colors.append("#f59e0b")   # yellow — watch
+            else:
+                colors.append("#22c55e")   # green — healthy
+
+        fig_risk = go.Figure()
+        fig_risk.add_trace(go.Bar(
+            # x axis = feature names
+            x=risk_df["Feature"],
+            # y axis = risk score (PSI × importance)
+            y=risk_df["Risk Score"],
+            marker_color=colors,
+            # Show PSI and importance on hover
+            customdata=risk_df[["Latest PSI", "Importance"]].values,
+            hovertemplate=(
+                "<b>%{x}</b><br>"
+                "Risk Score: %{y:.4f}<br>"
+                "PSI: %{customdata[0]:.4f}<br>"
+                "Importance: %{customdata[1]:.4f}<br>"
+                "<extra></extra>"
+            )
+        ))
+
+        # Add a reference line showing the alert threshold
+        # Any bar above this line is in the danger zone
+        fig_risk.add_hline(
+            y=0.05,                          # the threshold we used in Should Alert
+            line_dash="dash",
+            line_color="#ef4444",
+            annotation_text="Alert threshold"
+        )
+
+        fig_risk.update_layout(
+            title="Feature Risk Scores (PSI × Importance)",
+            xaxis_title="Feature",
+            yaxis_title="Risk Score",
+            height=400,
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+            xaxis_tickangle=-45,             # angle the labels so they don't overlap
+        )
+        st.plotly_chart(fig_risk, width="stretch")
+
+        st.divider()
+
+        # ── Detailed breakdown table ──
+        st.markdown("### 🔬 Full Feature Breakdown")
+        st.caption("Sorted by Risk Score. Only red rows need action.")
+
+        # Color the Should Alert column for quick scanning
+        def highlight_alert(val):
+            # If the value is True (should alert), make it red
+            if val == True:
+                return "background-color: #fecaca; color: #991b1b; font-weight: bold"
+            return "background-color: #dcfce7; color: #166534"
+
+        styled_risk = risk_df.style.map(highlight_alert, subset=["Should Alert"])
+        st.dataframe(styled_risk, width="stretch", height=400)
+
+        st.divider()
+
+        # ── PSI trend for top 3 riskiest features ──
+        # Instead of showing all features, only show the ones worth watching
+        st.markdown("### 📈 Trend — Top 3 Riskiest Features")
+        st.caption(
+            f"PSI over time for your highest-risk features. "
+            f"Sustained lines above the red threshold = alert."
+        )
+
+        # Get top 3 features by risk score
+        # .head(3) = take first 3 rows (already sorted by risk score descending)
+        top_features = risk_df.head(3)["Feature"].tolist()
+
+        fig_trend = go.Figure()
+
+        # Plot one line per top feature
+        # enumerate gives us (0, "PAY_0"), (1, "LIMIT_BAL"), etc.
+        colors_trend = ["#ef4444", "#6366f1", "#f59e0b"]  # red, purple, yellow
+        for i, feature in enumerate(top_features):
+            psi_col = f"{feature}_psi"
+            if psi_col not in all_days_df.columns:
+                continue
+
+            fig_trend.add_trace(go.Scatter(
+                x=all_days_df["day"],           # x axis = day labels
+                y=all_days_df[psi_col],         # y axis = PSI score for this feature
+                mode="lines+markers",
+                name=feature,                   # shown in legend
+                line=dict(color=colors_trend[i], width=2),
+                marker=dict(size=7)
+            ))
+
+        # Draw the critical threshold line so it's obvious when features cross it
+        fig_trend.add_hline(
+            y=psi_thresh,
+            line_dash="dash",
+            line_color="#ef4444",
+            annotation_text=f"Critical ({psi_thresh})"
+        )
+        fig_trend.add_hline(
+            y=PSI_WARN,
+            line_dash="dot",
+            line_color="#f59e0b",
+            annotation_text="Warning"
+        )
+
+        fig_trend.update_layout(
+            title="PSI Trend — Top Risk Features",
+            xaxis_title="Day",
+            yaxis_title="PSI Score",
+            height=380,
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+            xaxis_tickangle=-30,
+            legend=dict(orientation="h", y=-0.2)   # legend below chart
+        )
+        st.plotly_chart(fig_trend, width="stretch")
 
 # ─────────────────────────────────────────────
 # Footer
