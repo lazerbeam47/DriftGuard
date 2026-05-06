@@ -5,23 +5,39 @@ import os
 import joblib
 from collections import defaultdict
 import numpy as np
+from dotenv import load_dotenv
+load_dotenv()
 
 from drift.psi import calculate_psi
 from drift.ks import calculate_ks, ks_status
 from drift.prediction_drift import prediction_entropy, entropy_status
 from drift.trend import drift_trend_status
 from performance.decay import rolling_auc, performance_status
+from alerts.slack_alert import send_slack_alert
+
+# Import the shared smart alert brain
+# This same module is also used by dashboard.py
+# so the alert logic is IDENTICAL in both places
+from alerts.smart_alert import compute_risk_scores, build_slack_message
 
 REFERENCE_PATH = "data/reference.csv"
 REFERENCE_TARGET = "data/reference_target.csv"
 PRODUCTION_DIR = "data/production"
 MODEL_PATH = "model.pkl"
 
+# ── Alert thresholds ──────────────────────────────────────────────────────────
+# These match the dashboard defaults.
+# Later: move these to config.yaml so dashboard + monitor share one config file.
+PSI_CRITICAL     = 0.2    # PSI above this = critical drift
+PSI_WARNING      = 0.1    # PSI above this = warning
+CONSECUTIVE_DAYS = 3      # how many days in a row before we alert Slack
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 def psi_status(psi):
-    if psi > 0.25:
+    if psi > PSI_CRITICAL:
         return "🚨 DRIFT"
-    elif psi > 0.1:
+    elif psi > PSI_WARNING:
         return "⚠️ WARNING"
     else:
         return "OK"
@@ -29,16 +45,18 @@ def psi_status(psi):
 
 def main():
     reference = pd.read_csv(REFERENCE_PATH)
-    ref_y = pd.read_csv(REFERENCE_TARGET).values.ravel().astype(int)
-    model = joblib.load(MODEL_PATH)
+    ref_y     = pd.read_csv(REFERENCE_TARGET).values.ravel().astype(int)
+    model     = joblib.load(MODEL_PATH)
 
+    # psi_history tracks PSI for each feature across all days
+    # e.g. {"PAY_0": [0.05, 0.12, 0.25], "LIMIT_BAL": [0.03, 0.04, 0.03], ...}
+    # This is what the smart alert uses to check consecutive days
     psi_history = defaultdict(list)
 
     # ----- Baseline -----
-    ref_preds = model.predict_proba(reference)[:, 1]
-    ref_entropy = prediction_entropy(ref_preds)
-
-    ref_aucs = rolling_auc(ref_y, ref_preds)
+    ref_preds    = model.predict_proba(reference)[:, 1]
+    ref_entropy  = prediction_entropy(ref_preds)
+    ref_aucs     = rolling_auc(ref_y, ref_preds)
     baseline_auc = ref_aucs.mean() if len(ref_aucs) > 0 else None
 
     print(f"\nBaseline entropy: {ref_entropy:.3f}")
@@ -48,7 +66,7 @@ def main():
         print("Baseline rolling AUC: insufficient data")
 
     all_preds = []
-    all_true = []
+    all_true  = []
 
     for file in sorted(os.listdir(PRODUCTION_DIR)):
         if not file.endswith(".csv") or file.endswith("_labels.csv"):
@@ -60,13 +78,17 @@ def main():
         # ---------- FEATURE DRIFT ----------
         for col in reference.columns:
             psi = calculate_psi(reference[col], prod[col])
+
+            # Append today's PSI to this feature's history list
+            # e.g. after day 3: psi_history["PAY_0"] = [0.05, 0.12, 0.25]
             psi_history[col].append(psi)
 
-            psi_flag = psi_status(psi)
+            psi_flag  = psi_status(psi)
             ks_stat, p_val = calculate_ks(reference[col], prod[col])
-            ks_flag = ks_status(ks_stat, p_val)
+            ks_flag   = ks_status(ks_stat, p_val)
             trend_flag = drift_trend_status(psi_history[col])
 
+            # Only print features that have something worth noting
             if psi_flag != "OK" or ks_flag != "OK":
                 print(
                     f"[Feature] {col:15s} "
@@ -75,47 +97,88 @@ def main():
                     f"Trend={trend_flag}"
                 )
 
+        # ---------- SMART ALERTING ----------
+        # Now that we've updated psi_history for this day,
+        # run the smart alert logic across all features.
+        #
+        # compute_risk_scores() looks at:
+        # - PSI × feature importance = risk score
+        # - whether PSI has been high for CONSECUTIVE_DAYS in a row
+        # And returns a ranked list of features with alert decisions.
+
+        feature_names = list(reference.columns)
+
+        risk_results = compute_risk_scores(
+            model            = model,
+            feature_names    = feature_names,
+            psi_history      = psi_history,
+            psi_critical     = PSI_CRITICAL,
+            consecutive_days = CONSECUTIVE_DAYS,
+        )
+
+        # Split into features that should alert vs features to just watch
+        alert_features   = [r for r in risk_results if r["should_alert"]]
+        warning_features = [
+            r for r in risk_results
+            if not r["should_alert"] and r["latest_psi"] >= PSI_WARNING
+        ]
+
+        # Build one clean Slack message for this batch
+        # Returns None if nothing worth reporting
+        slack_msg = build_slack_message(file, alert_features, warning_features)
+
+        if slack_msg:
+            print(f"\n[Alert] Sending Slack message for {file}...")
+            send_slack_alert(slack_msg)
+        else:
+            # This is good — means the model is healthy for this batch
+            print(f"[Alert] No significant drift detected. No Slack message sent.")
+
         # ---------- PREDICTION DRIFT ----------
-        prod_preds = model.predict_proba(prod)[:, 1]
+        prod_preds  = model.predict_proba(prod)[:, 1]
         prod_entropy = prediction_entropy(prod_preds)
         entropy_flag = entropy_status(prod_entropy, ref_entropy)
 
         print(f"[Prediction] Entropy={prod_entropy:.3f} → {entropy_flag}")
 
-        # ---------- LOAD LABELS (REQUIRED) ----------
+        # ---------- LOAD LABELS (OPTIONAL) ----------
         label_path = f"{PRODUCTION_DIR}/{file.replace('.csv', '_labels.csv')}"
 
         if not os.path.exists(label_path):
             print("[Performance] Labels not available yet")
             continue
 
-        prod_y = pd.read_csv(label_path).values.ravel().astype(int)
+        prod_y = pd.read_csv(label_path)["target"].values.astype(int)
+
+        # Only use as many labels as we have production rows
+        # (labels file might be larger than production file)
+        n = len(prod)
+        prod_y = prod_y[:n]
 
         for p, y in zip(prod_preds, prod_y):
             all_preds.append(p)
-            all_true.append(y)  
+            all_true.append(y)
 
         # ---------- PERFORMANCE DECAY ----------
-        aucs = rolling_auc(
-            np.array(all_true),
-            np.array(all_preds)
-        )
+        aucs = rolling_auc(np.array(all_true), np.array(all_preds))
+
         if all(
             drift_trend_status(psi_history[col]) == "INSUFFICIENT DATA"
             for col in psi_history
         ):
             print("[Performance] Waiting for drift trend confirmation")
             continue
+
         if len(aucs) == 0 or baseline_auc is None:
             print("[Performance] Not enough stable data yet")
             continue
 
         recent_auc = aucs[-1]
-        perf_flag = performance_status(recent_auc, baseline_auc)
+        perf_flag  = performance_status(recent_auc, baseline_auc)
 
-        print(
-            f"[Performance] Rolling AUC={recent_auc:.3f} → {perf_flag}"
-        )
+        print(f"[Performance] Rolling AUC={recent_auc:.3f} → {perf_flag}")
+
+    print("\n✅ Monitoring completed.")
 
 
 if __name__ == "__main__":

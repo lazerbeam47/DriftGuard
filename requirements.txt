@@ -4,3 +4,6 @@ scikit-learn==1.8.0
 joblib
 scipy
 streamlit
+plotly
+slack-sdk
+python-dotenv

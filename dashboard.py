@@ -213,94 +213,81 @@ all_days_df = compute_all_days(tuple(prod_files), psi_thresh, ks_thresh)
 # ─────────────────────────────────────────────
 # TAB LAYOUT
 # ─────────────────────────────────────────────
+
 # ─────────────────────────────────────────────
-# SMART ALERTING LOGIC
-# This is the core anti-alert-fatigue system.
-# Instead of screaming about every feature that moves,
-# we only care about features the model actually relies on.
+# SMART ALERTING — import shared logic
+# compute_risk_scores lives in src/alerts/smart_alert.py
+# Both this dashboard and monitor.py import from there,
+# so the alert logic is IDENTICAL in both places.
 # ─────────────────────────────────────────────
+import sys as _sys
+_sys.path.insert(0, "src")
+try:
+    from alerts.smart_alert import compute_risk_scores as _compute_risk_scores
+    _smart_alert_available = True
+except Exception:
+    _smart_alert_available = False
+
+
+def all_days_df_to_psi_history(all_days_df, feature_names):
+    """
+    Converts all_days_df (dashboard format) into psi_history (monitor format).
+
+    all_days_df looks like:
+        day    | LIMIT_BAL_psi | PAY_0_psi | AGE_psi | ...
+        day_01 | 0.05          | 0.12      | 0.03    | ...
+        day_02 | 0.08          | 0.25      | 0.04    | ...
+
+    psi_history looks like:
+        {"LIMIT_BAL": [0.05, 0.08], "PAY_0": [0.12, 0.25], ...}
+
+    The shared compute_risk_scores() expects psi_history format.
+    This bridges the two so the dashboard can use the same function.
+    """
+    psi_history = {}
+    for feature in feature_names:
+        psi_col = f"{feature}_psi"
+        if psi_col in all_days_df.columns:
+            # .tolist() converts the pandas column into a plain Python list
+            psi_history[feature] = all_days_df[psi_col].tolist()
+    return psi_history
+
 
 def compute_risk_scores(model, feature_names, all_days_df, psi_thresh, consecutive_days=3):
     """
-    Computes a Risk Score per feature = PSI × Feature Importance.
-    Then checks if that risk score has been high for N consecutive days.
-    Only features that are BOTH important AND consistently drifting get flagged.
-
-    Returns a dataframe with one row per feature, sorted by risk score.
+    Wrapper that converts all_days_df to psi_history format,
+    then calls the shared compute_risk_scores from smart_alert.py.
+    Returns a DataFrame (same format as before) for the dashboard UI.
     """
+    if not _smart_alert_available:
+        return pd.DataFrame()
 
-    # --- Step 1: Get feature importance from the model ---
-    # model.coef_ gives us the weights the logistic regression learned.
-    # A higher weight (positive or negative) means the model leans on that feature more.
-    # We take abs() because direction doesn't matter — we care about magnitude.
-    # Result: a numpy array like [0.3, 0.8, 0.05, ...] — one number per feature
-    raw_importance = np.abs(model.coef_[0])
+    # Convert dashboard format → shared format
+    psi_history = all_days_df_to_psi_history(all_days_df, feature_names)
 
-    # Normalize so importances add up to 1 (makes them easier to compare)
-    # e.g. [0.3, 0.8, 0.05] → [0.25, 0.67, 0.04]
-    total = raw_importance.sum()
-    normalized_importance = raw_importance / total if total > 0 else raw_importance
+    # Call the shared function (same one monitor.py uses)
+    results = _compute_risk_scores(
+        model=model,
+        feature_names=feature_names,
+        psi_history=psi_history,
+        psi_critical=psi_thresh,
+        consecutive_days=consecutive_days,
+    )
 
-    # Build a dictionary: {"LIMIT_BAL": 0.25, "PAY_0": 0.67, ...}
-    importance_map = dict(zip(feature_names, normalized_importance))
+    # Convert list of dicts → DataFrame with capitalized column names for display
+    if not results:
+        return pd.DataFrame()
 
-    # --- Step 2: Get the PSI for each feature on the MOST RECENT day ---
-    # all_days_df has one row per production day, one column per feature's PSI
-    # e.g. columns: ["day", "LIMIT_BAL_psi", "PAY_0_psi", ...]
-    # .iloc[-1] grabs the last row = most recent day
-    latest_day = all_days_df.iloc[-1]
+    df = pd.DataFrame([{
+        "Feature":      r["feature"],
+        "Importance":   r["importance"],
+        "Latest PSI":   r["latest_psi"],
+        "Risk Score":   r["risk_score"],
+        "Sustained":    r["sustained"],
+        "Should Alert": r["should_alert"],
+    } for r in results])
 
-    # --- Step 3: For each feature, compute Risk Score = PSI × Importance ---
-    results = []
-    for feature in feature_names:
-
-        psi_col = f"{feature}_psi"   # column name in all_days_df for this feature's PSI
-
-        # Skip if we don't have PSI data for this feature
-        if psi_col not in all_days_df.columns:
-            continue
-
-        # Get this feature's PSI on the latest day
-        latest_psi = latest_day[psi_col]
-
-        # Get this feature's importance (how much the model relies on it)
-        importance = importance_map.get(feature, 0)
-
-        # Risk Score: high PSI + high importance = danger
-        # e.g. PSI=0.8, importance=0.67 → risk=0.536 (very dangerous)
-        # e.g. PSI=0.8, importance=0.04 → risk=0.032 (not worth alerting)
-        risk_score = latest_psi * importance
-
-        # --- Step 4: Check if drift has been sustained for N consecutive days ---
-        # We don't want to alert on one-off spikes.
-        # Only alert if the feature has been above threshold for 3+ days in a row.
-
-        # Get the PSI values for this feature across ALL days as a list
-        # e.g. [0.05, 0.12, 0.25, 0.31, 0.28] — one per day
-        psi_history = all_days_df[psi_col].tolist()
-
-        # Look at only the last N days
-        # e.g. if consecutive_days=3, look at last 3 values
-        recent_psi = psi_history[-consecutive_days:]
-
-        # Check if ALL of those recent values are above the critical threshold
-        # all([True, True, True]) → True (sustained drift → alert)
-        # all([True, False, True]) → False (not sustained → no alert)
-        sustained = len(recent_psi) >= consecutive_days and all(p >= psi_thresh for p in recent_psi)
-
-        results.append({
-            "Feature":    feature,
-            "Importance": round(importance, 4),   # how much the model uses this feature
-            "Latest PSI": round(latest_psi, 4),   # how much this feature has drifted today
-            "Risk Score": round(risk_score, 4),   # combined danger signal
-            "Sustained":  sustained,               # has it been drifting for 3+ days?
-            "Should Alert": sustained and risk_score > 0.05,  # final yes/no alert decision
-        })
-
-    # Sort by Risk Score descending — most dangerous features first
-    results_df = pd.DataFrame(results).sort_values("Risk Score", ascending=False)
-
-    return results_df
+    return df
 
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
