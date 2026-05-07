@@ -27,3 +27,4 @@ data/production/
 
 # Logs
 *.log
+.env
