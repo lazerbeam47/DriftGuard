@@ -1,0 +1,6 @@
+monitoring:
+  consecutive_days: 4
+  ks_critical: 0.1
+  psi_critical: 0.2
+  psi_warning: 0.1
+  risk_score_threshold: 0.05

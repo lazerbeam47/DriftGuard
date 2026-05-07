@@ -17,6 +17,44 @@ import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
 from scipy import stats
+import yaml
+
+# ─────────────────────────────────────────────
+# Load config.yaml
+# This is the single source of truth for thresholds.
+# Both dashboard and monitor.py read from here.
+# ─────────────────────────────────────────────
+CONFIG_PATH = "config.yaml"
+
+def load_config():
+    """Read config.yaml and return the monitoring section."""
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH) as f:
+            return yaml.safe_load(f)
+    # Fallback defaults if config.yaml doesn't exist
+    return {
+        "monitoring": {
+            "psi_critical": 0.2,
+            "psi_warning": 0.1,
+            "ks_critical": 0.1,
+            "consecutive_days": 3,
+            "risk_score_threshold": 0.05,
+        }
+    }
+
+def save_config(psi_critical, psi_warning, ks_critical, consecutive_days, risk_score_threshold):
+    """Write updated thresholds back to config.yaml."""
+    config = {
+        "monitoring": {
+            "psi_critical": round(float(psi_critical), 2),
+            "psi_warning": round(float(psi_warning), 2),
+            "ks_critical": round(float(ks_critical), 2),
+            "consecutive_days": int(consecutive_days),
+            "risk_score_threshold": round(float(risk_score_threshold), 2),
+        }
+    }
+    with open(CONFIG_PATH, "w") as f:
+        yaml.dump(config, f, default_flow_style=False)
 
 # ─────────────────────────────────────────────
 # Page config
@@ -157,8 +195,58 @@ if prod_files:
     selected_day = prod_files[day_labels.index(selected_label)]
 
 st.sidebar.divider()
-psi_thresh = st.sidebar.slider("PSI critical threshold", 0.05, 0.5, PSI_CRIT, 0.05)
-ks_thresh = st.sidebar.slider("KS critical threshold", 0.01, 0.3, KS_CRIT, 0.01)
+
+# ── Load current config values as slider defaults ──
+# Sliders always start at whatever is saved in config.yaml
+_cfg = load_config()["monitoring"]
+
+st.sidebar.markdown("### ⚙️ Thresholds")
+
+psi_thresh = st.sidebar.slider(
+    "PSI critical threshold",
+    0.05, 0.5,
+    float(_cfg["psi_critical"]),
+    0.05
+)
+
+ks_thresh = st.sidebar.slider(
+    "KS critical threshold",
+    0.01, 0.3,
+    float(_cfg["ks_critical"]),
+    0.01
+)
+
+# Consecutive days slider — moved here so all three sliders are together
+_cd_default = min(
+    int(_cfg["consecutive_days"]),
+    len(prod_files) if prod_files else 7
+)
+consecutive_days = st.sidebar.slider(
+    "Consecutive days before alert",
+    1, 7,
+    value=_cd_default,
+    step=1,
+    key="consecutive_days"  # saved to session_state so Save button can read it
+)
+
+# ── Save Settings button — after all 3 sliders ──
+# Writes current slider values to config.yaml
+# Next time monitor.py runs, it picks up the new values
+st.sidebar.divider()
+st.sidebar.markdown("### 💾 Save Settings")
+st.sidebar.caption("Saves thresholds to config.yaml. Restart monitor to apply.")
+
+if st.sidebar.button("💾 Save to config.yaml"):
+    save_config(
+        psi_critical=psi_thresh,
+        psi_warning=round(psi_thresh * 0.5, 2),
+        ks_critical=ks_thresh,
+        consecutive_days=consecutive_days,
+        risk_score_threshold=0.05
+    )
+    st.sidebar.success("✅ Saved! Restart monitor to apply.")
+
+
 
 # ─────────────────────────────────────────────
 # Header
@@ -646,11 +734,7 @@ with tab5:
 
         # How many consecutive days of drift before we alert?
         # Putting this in the sidebar so the user can tune it
-        consecutive_days = st.sidebar.slider(
-            "Consecutive days before alert", 1, 7,
-            value=min(3, len(all_days_df)),   # default 3, but cap at available days
-            step=1
-        )
+
 
         # --- Run the smart alerting logic ---
         # This calls the function we defined above

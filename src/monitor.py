@@ -25,12 +25,27 @@ REFERENCE_TARGET = "data/reference_target.csv"
 PRODUCTION_DIR = "data/production"
 MODEL_PATH = "model.pkl"
 
-# ── Alert thresholds ──────────────────────────────────────────────────────────
-# These match the dashboard defaults.
-# Later: move these to config.yaml so dashboard + monitor share one config file.
-PSI_CRITICAL     = 0.2    # PSI above this = critical drift
-PSI_WARNING      = 0.1    # PSI above this = warning
-CONSECUTIVE_DAYS = 3      # how many days in a row before we alert Slack
+# ── Load thresholds from config.yaml ─────────────────────────────────────────
+# config.yaml is the single source of truth shared with the dashboard.
+# Change thresholds in the dashboard → click Save → restart monitor.
+# ─────────────────────────────────────────────────────────────────────────────
+import yaml
+
+_CONFIG_PATH = "config.yaml"
+
+def _load_config():
+    if os.path.exists(_CONFIG_PATH):
+        with open(_CONFIG_PATH) as f:
+            return yaml.safe_load(f).get("monitoring", {})
+    return {}
+
+_cfg = _load_config()
+
+PSI_CRITICAL     = _cfg.get("psi_critical", 0.2)
+PSI_WARNING      = _cfg.get("psi_warning", 0.1)
+CONSECUTIVE_DAYS = _cfg.get("consecutive_days", 3)
+
+print(f"Config loaded → PSI critical: {PSI_CRITICAL} | PSI warning: {PSI_WARNING} | Consecutive days: {CONSECUTIVE_DAYS}")
 # ─────────────────────────────────────────────────────────────────────────────
 
 

@@ -11,7 +11,7 @@ def simulate_day(reference_df, reference_y, day):
     prod = reference_df.sample(frac=0.3, random_state=day)
     prod_y = reference_y.loc[prod.index]
     # Artificially shift PAY_0 distribution for all days
-    prod["PAY_0"] = prod["PAY_0"] + 2  # push it consistently higher
+    prod["PAY_0"] = (prod["PAY_0"] + 1).clip(upper=8)  # push it consistently higher
     if day == 2:
         prod["AGE"] += 7
     if day == 3:
@@ -22,9 +22,8 @@ def simulate_day(reference_df, reference_y, day):
     return prod, prod_y
 
 
-
 def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True) 
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # IMPORTANT: preserve index
     reference = pd.read_csv("data/reference.csv")
