@@ -259,7 +259,7 @@ Research / advanced ideas
 
 ## Screenshots
 
-I added example screenshots under `assets/`. The current images in the repo are:
+ The current images in the repo are:
 
 - `assets/overview_ss.png` — Dashboard overview (Overview tab)
 - `assets/featuredrift_ss.png` — Feature drift deep-dive (distributions + heatmap)
@@ -267,7 +267,6 @@ I added example screenshots under `assets/`. The current images in the repo are:
 - `assets/prediction_ss.png` — Prediction drift (probability distributions + entropy)
 - `assets/smartalert_ss.png` — Smart Alerts (risk-ranked features + summary banner)
 
-Embed them in the README like this:
 
 ![Dashboard overview](assets/overview_ss.png)
 
@@ -279,8 +278,4 @@ Embed them in the README like this:
 
 ![Smart alerts](assets/smartalert_ss.png)
 
-Notes:
 
-- Use relative paths so images render on GitHub.
-- Keep image sizes reasonable (max width ~1200px) to avoid large commits and slow rendering.
-- Optimize images (pngquant / mozjpeg) before committing and add descriptive alt text for accessibility.
