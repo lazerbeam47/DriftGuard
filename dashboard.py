@@ -27,12 +27,19 @@ import yaml
 CONFIG_PATH = "config.yaml"
 
 def load_config():
-    """Read config.yaml and return the monitoring section."""
+    """Read config.yaml and return the full config dict."""
     if os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH) as f:
             return yaml.safe_load(f)
     # Fallback defaults if config.yaml doesn't exist
     return {
+        "data": {
+            "reference_path": "data/reference.csv",
+            "reference_target_path": "data/reference_target.csv",
+            "production_dir": "data/production",
+            "model_path": "model.pkl",
+            "target_column": "target",
+        },
         "monitoring": {
             "psi_critical": 0.2,
             "psi_warning": 0.1,
@@ -42,9 +49,23 @@ def load_config():
         }
     }
 
+def get_data_config():
+    """Shortcut to get the data section of config."""
+    return load_config().get("data", {})
+
 def save_config(psi_critical, psi_warning, ks_critical, consecutive_days, risk_score_threshold):
-    """Write updated thresholds back to config.yaml."""
+    """
+    Write updated thresholds back to config.yaml.
+    Preserves the data section so user paths are never overwritten
+    when saving monitoring thresholds.
+    """
+    # Load existing config first so we don't lose the data section
+    existing = load_config()
+
     config = {
+        # Keep existing data paths exactly as they are
+        "data": existing.get("data", {}),
+        # Update only the monitoring thresholds
         "monitoring": {
             "psi_critical": round(float(psi_critical), 2),
             "psi_warning": round(float(psi_warning), 2),
@@ -141,24 +162,37 @@ def ks_status(v):
 # ─────────────────────────────────────────────
 @st.cache_data
 def load_reference():
-    ref = pd.read_csv("data/reference.csv")
+    # Read paths from config.yaml — not hardcoded
+    dcfg = get_data_config()
+    ref_path    = dcfg.get("reference_path", "data/reference.csv")
+    target_path = dcfg.get("reference_target_path", "data/reference_target.csv")
+
+    ref = pd.read_csv(ref_path)
     target = None
-    if os.path.exists("data/reference_target.csv"):
-        target = pd.read_csv("data/reference_target.csv")
+    if os.path.exists(target_path):
+        target = pd.read_csv(target_path)
     return ref, target
 
 @st.cache_data
 def load_production_files():
-    files = sorted(glob.glob("data/production/day_*.csv"))
-    # exclude label files
+    # Read production dir from config.yaml
+    dcfg = get_data_config()
+    prod_dir = dcfg.get("production_dir", "data/production")
+
+    # Find all CSVs in production dir, exclude label files
+    files = sorted(glob.glob(f"{prod_dir}/*.csv"))
     files = [f for f in files if "label" not in f]
     return files
 
 @st.cache_data
 def load_model():
-    if os.path.exists("model.pkl"):
+    # Read model path from config.yaml
+    dcfg = get_data_config()
+    model_path = dcfg.get("model_path", "model.pkl")
+
+    if os.path.exists(model_path):
         try:
-            return joblib.load("model.pkl")
+            return joblib.load(model_path)
         except Exception:
             return None
     return None
@@ -172,11 +206,11 @@ st.sidebar.markdown("Production ML Monitoring Dashboard")
 st.sidebar.divider()
 
 # Check data availability
-ref_ok = os.path.exists("data/reference.csv")
+ref_ok = os.path.exists(get_data_config().get("reference_path", "data/reference.csv"))
 prod_files = load_production_files() if ref_ok else []
 
 if not ref_ok:
-    st.error("❌ `data/reference.csv` not found. Please run `main.ipynb` first to generate reference data.")
+    st.error(f"❌ Reference data not found at `{get_data_config().get('reference_path', 'data/reference.csv')}`. Please run `main.ipynb` first.")
     st.stop()
 
 reference_df, reference_target = load_reference()
@@ -255,7 +289,8 @@ st.title("🛡️ DriftGuard — ML Monitoring Dashboard")
 st.caption("Detect data drift, prediction behavior changes, and performance decay.")
 
 if not prod_files:
-    st.warning("No production files found in `data/production/`. Add `day_01.csv`, `day_02.csv`, etc.")
+    _prod_dir = get_data_config().get("production_dir", "data/production")
+    st.warning(f"No production files found in `{_prod_dir}/`. Add `day_01.csv`, `day_02.csv`, etc.")
     st.stop()
 
 # ─────────────────────────────────────────────
@@ -277,7 +312,7 @@ def compute_all_days(prod_files, psi_thresh, ks_thresh):
     for f in prod_files:
         day_label = os.path.basename(f).replace(".csv", "")
         df = pd.read_csv(f)
-        ref = pd.read_csv("data/reference.csv")
+        ref = pd.read_csv(get_data_config().get("reference_path", "data/reference.csv"))
         common = [c for c in ref.select_dtypes(include=[np.number]).columns if c in df.columns]
         day_rec = {"day": day_label}
         for col in common:
@@ -636,7 +671,9 @@ with tab4:
             common_cols_perf = [c for c in numeric_cols if c in prod_df.columns]
 
             # The labels file has multiple columns — grab "target" specifically
-            y_true = labels_df["target"].values.astype(int)
+            # Get target column name from config — not hardcoded
+            _target_col = get_data_config().get("target_column", "target")
+            y_true = labels_df[_target_col].values.astype(int)
 
             # Labels file might be larger than production file (e.g. full dataset vs one day)
             # Trim labels to match the number of rows in production data

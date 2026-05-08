@@ -20,11 +20,6 @@ from alerts.slack_alert import send_slack_alert
 # so the alert logic is IDENTICAL in both places
 from alerts.smart_alert import compute_risk_scores, build_slack_message
 
-REFERENCE_PATH = "data/reference.csv"
-REFERENCE_TARGET = "data/reference_target.csv"
-PRODUCTION_DIR = "data/production"
-MODEL_PATH = "model.pkl"
-
 # ── Load thresholds from config.yaml ─────────────────────────────────────────
 # config.yaml is the single source of truth shared with the dashboard.
 # Change thresholds in the dashboard → click Save → restart monitor.
@@ -36,11 +31,28 @@ _CONFIG_PATH = "config.yaml"
 def _load_config():
     if os.path.exists(_CONFIG_PATH):
         with open(_CONFIG_PATH) as f:
-            return yaml.safe_load(f).get("monitoring", {})
+            full = yaml.safe_load(f)
+            # Merge data + monitoring sections into one flat dict
+            # so we can read paths and thresholds the same way
+            merged = {}
+            merged.update(full.get("data", {}))
+            merged.update(full.get("monitoring", {}))
+            return merged
     return {}
 
 _cfg = _load_config()
 
+# ── All paths come from config.yaml ──────────────────────────────────────────
+# User edits config.yaml to point at their own data and model.
+# Nothing is hardcoded here.
+# ─────────────────────────────────────────────────────────────────────────────
+REFERENCE_PATH   = _cfg.get("reference_path",        "data/reference.csv")
+REFERENCE_TARGET = _cfg.get("reference_target_path", "data/reference_target.csv")
+PRODUCTION_DIR   = _cfg.get("production_dir",        "data/production")
+MODEL_PATH       = _cfg.get("model_path",            "model.pkl")
+TARGET_COLUMN    = _cfg.get("target_column",         "target")
+
+# ── Monitoring thresholds ─────────────────────────────────────────────────────
 PSI_CRITICAL     = _cfg.get("psi_critical", 0.2)
 PSI_WARNING      = _cfg.get("psi_warning", 0.1)
 CONSECUTIVE_DAYS = _cfg.get("consecutive_days", 3)
@@ -140,14 +152,18 @@ def main():
 
         # Build one clean Slack message for this batch
         # Returns None if nothing worth reporting
-        slack_msg = build_slack_message(file, alert_features, warning_features)
-
-        if slack_msg:
+        # Only send Slack when sustained drift confirmed (should_alert = True)
+        # Watch-level features logged to terminal only — no Slack spam
+        if alert_features:
+            slack_msg = build_slack_message(file, alert_features, warning_features=[])
             print(f"\n[Alert] Sending Slack message for {file}...")
             send_slack_alert(slack_msg)
         else:
-            # This is good — means the model is healthy for this batch
-            print(f"[Alert] No significant drift detected. No Slack message sent.")
+            if warning_features:
+                names = ", ".join(w["feature"] for w in warning_features)
+                print(f"[Alert] Watching: {names} — not yet sustained. No Slack sent.")
+            else:
+                print(f"[Alert] All clear. No Slack sent.")
 
         # ---------- PREDICTION DRIFT ----------
         prod_preds  = model.predict_proba(prod)[:, 1]
@@ -163,7 +179,7 @@ def main():
             print("[Performance] Labels not available yet")
             continue
 
-        prod_y = pd.read_csv(label_path)["target"].values.astype(int)
+        prod_y = pd.read_csv(label_path)[TARGET_COLUMN].values.astype(int)
 
         # Only use as many labels as we have production rows
         # (labels file might be larger than production file)
